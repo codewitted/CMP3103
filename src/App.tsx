@@ -23,7 +23,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { cn } from './lib/utils';
 
 // --- Types ---
-type RobotState = 'IDLE' | 'SEARCHING' | 'TARGETING' | 'PUSHING' | 'BACKING_UP' | 'RETURNING' | 'AVOIDING';
+type RobotState = 'IDLE' | 'SEARCHING' | 'TARGETING' | 'PUSHING' | 'REVERSING' | 'RETURNING' | 'AVOIDING' | 'CHARGING';
 
 interface Telemetry {
   battery: number;
@@ -34,6 +34,14 @@ interface Telemetry {
   lidarDist: number;
   targetFound: boolean;
 }
+
+// --- Utils ---
+const normalizeAngle = (angle: number) => {
+  let a = angle % (2 * Math.PI);
+  if (a > Math.PI) a -= 2 * Math.PI;
+  if (a < -Math.PI) a += 2 * Math.PI;
+  return a;
+};
 
 // --- Components ---
 
@@ -129,7 +137,7 @@ interface BoxData {
   isCleared: boolean;
 }
 
-const Simulation = ({ state, telemetry, boxes }: { state: RobotState, telemetry: Telemetry, boxes: BoxData[] }) => {
+const Simulation = ({ state, telemetry, boxes, obstacles }: { state: RobotState, telemetry: Telemetry, boxes: BoxData[], obstacles: { x: number, y: number, r: number }[] }) => {
   return (
     <div className="w-full h-full bg-black relative overflow-hidden rounded-xl border border-white/10">
       <Canvas shadows>
@@ -150,6 +158,29 @@ const Simulation = ({ state, telemetry, boxes }: { state: RobotState, telemetry:
           rotation={telemetry.heading} 
           state={state}
         />
+
+        {/* LiDAR Visualization */}
+        {state !== 'IDLE' && (
+          <group position={[telemetry.position.x, 0.2, telemetry.position.y]} rotation={[0, telemetry.heading, 0]}>
+            <mesh rotation={[-Math.PI / 2, 0, 0]}>
+              <ringGeometry args={[0.5, 5, 32]} />
+              <meshBasicMaterial color="#22c55e" transparent opacity={0.05} side={THREE.DoubleSide} />
+            </mesh>
+            {/* Laser Line */}
+            <mesh position={[2.5, 0, 0]}>
+              <boxGeometry args={[5, 0.01, 0.01]} />
+              <meshBasicMaterial color="#22c55e" transparent opacity={0.2} />
+            </mesh>
+          </group>
+        )}
+
+        {/* Static Obstacles */}
+        {obstacles.map((obs, i) => (
+          <mesh key={i} position={[obs.x, 0.5, obs.y]} castShadow>
+            <cylinderGeometry args={[obs.r, obs.r, 1, 32]} />
+            <meshStandardMaterial color="#444" />
+          </mesh>
+        ))}
 
         {/* Dynamic Boxes with Hard Collisions */}
         {boxes.map((box) => (
@@ -209,6 +240,12 @@ export default function App() {
   const [state, setState] = useState<RobotState>('IDLE');
   const [isRunning, setIsRunning] = useState(false);
   const [timeScale, setTimeScale] = useState(1.0); // Real-Time Factor (RTF)
+  const [obstacles] = useState([
+    { x: 0, y: 2, r: 0.4 },
+    { x: 2, y: 0, r: 0.4 },
+    { x: -2, y: 0, r: 0.4 },
+    { x: 0, y: -2, r: 0.4 }
+  ]);
   const [boxes, setBoxes] = useState<BoxData[]>([
     { id: 'box1', position: { x: 3, y: 3 }, startPosition: { x: 3, y: 3 }, color: '#ef4444', isCleared: false },
     { id: 'box2', position: { x: -3, y: -3 }, startPosition: { x: -3, y: -3 }, color: '#3b82f6', isCleared: false },
@@ -224,6 +261,8 @@ export default function App() {
     lidarDist: 5.0,
     targetFound: false
   });
+
+  const [hsvThresholds, setHsvThresholds] = useState({ h: [0, 180], s: [0, 255], v: [0, 255] });
 
   const handleReset = () => {
     setIsRunning(false);
@@ -252,13 +291,6 @@ export default function App() {
       return;
     }
 
-    const normalizeAngle = (angle: number) => {
-      let a = angle % (2 * Math.PI);
-      if (a > Math.PI) a -= 2 * Math.PI;
-      if (a < -Math.PI) a += 2 * Math.PI;
-      return a;
-    };
-
     const tickRate = 50; // Base 20Hz
     const interval = setInterval(() => {
       setTelemetry(prev => {
@@ -270,13 +302,41 @@ export default function App() {
         
         const dt = (tickRate / 1000) * timeScale;
 
-        // Simple State Machine Logic
-        if (state === 'IDLE') newState = 'SEARCHING';
-        
-        if (state === 'SEARCHING') {
+        // --- 1. Battery & Safety Management ---
+        // Return to base if battery is low (<15%)
+        if (prev.battery < 15 && state !== 'CHARGING' && state !== 'RETURNING') {
+          newState = 'RETURNING';
+        }
+        // Force charging state if critical (<5%)
+        if (prev.battery < 5) newState = 'CHARGING';
+
+        // --- 2. Obstacle Avoidance (Reactive LiDAR) ---
+        const checkObstacles = () => {
+          for (const obs of obstacles) {
+            const dx = obs.x - newX;
+            const dy = obs.y - newY;
+            const dist = Math.sqrt(dx*dx + dy*dy);
+            // Collision radius includes robot width + safety margin
+            if (dist < obs.r + 0.6) {
+              return true;
+            }
+          }
+          return false;
+        };
+
+        // --- 3. State Machine Logic ---
+        if (state === 'IDLE') {
+          newState = 'SEARCHING';
+        } else if (state === 'SEARCHING') {
+          // Rotate in place to find targets
           newHeading = normalizeAngle(newHeading + 1.5 * dt);
           newSpeed = 0;
           
+          if (checkObstacles()) {
+            newState = 'AVOIDING';
+          }
+
+          // Search for uncleared boxes within vision cone
           const visibleBox = boxes.find(b => {
             if (b.isCleared) return false;
             const dx = b.position.x - newX;
@@ -284,11 +344,20 @@ export default function App() {
             const dist = Math.sqrt(dx*dx + dy*dy);
             const angleToBox = Math.atan2(-dy, dx);
             const angleDiff = Math.abs(normalizeAngle(newHeading - angleToBox));
+            // 6m range, approx 45-degree FOV
             return dist < 6 && angleDiff < 0.4;
           });
 
           if (visibleBox) newState = 'TARGETING';
+        } else if (state === 'AVOIDING') {
+          // Simple reactive avoidance: reverse and turn
+          newSpeed = -0.3;
+          newHeading = normalizeAngle(newHeading + 2.0 * dt);
+          newX += Math.cos(newHeading) * newSpeed * dt;
+          newY -= Math.sin(newHeading) * newSpeed * dt;
+          if (!checkObstacles()) newState = 'SEARCHING';
         } else if (state === 'TARGETING') {
+          // PID-like heading correction toward target
           newSpeed = 0.4;
           
           const activeBoxes = boxes.filter(b => !b.isCleared);
@@ -318,6 +387,7 @@ export default function App() {
           if (dist > 7 || Math.abs(angleError) > 1.2) newState = 'SEARCHING';
 
         } else if (state === 'PUSHING') {
+          // High-torque push state
           newSpeed = 0.8;
           const moveX = Math.cos(newHeading) * newSpeed * dt;
           const moveY = -Math.sin(newHeading) * newSpeed * dt;
@@ -325,6 +395,7 @@ export default function App() {
           newX += moveX;
           newY += moveY;
 
+          // Update box positions based on robot contact
           setBoxes(currentBoxes => currentBoxes.map(b => {
             if (b.isCleared) return b;
             const dx = b.position.x - newX;
@@ -352,17 +423,18 @@ export default function App() {
             return b;
           }));
 
-          // If robot hits boundary while pushing, back up
+          // Boundary safety while pushing
           if (Math.abs(newX) > 4.5 || Math.abs(newY) > 4.5) {
-            newState = 'BACKING_UP';
+            newState = 'REVERSING';
           }
 
-          // If the box we were pushing is now cleared, stop pushing
+          // Stop pushing once box is cleared
           const currentlyPushing = boxes.find(b => Math.sqrt(Math.pow(b.position.x - newX, 2) + Math.pow(b.position.y - newY, 2)) < 0.8);
           if (currentlyPushing?.isCleared) {
-            newState = 'BACKING_UP';
+            newState = 'REVERSING';
           }
-        } else if (state === 'BACKING_UP') {
+        } else if (state === 'REVERSING') {
+          // Post-push recovery
           newSpeed = -0.4; // Reverse
           newX += Math.cos(newHeading) * newSpeed * dt;
           newY -= Math.sin(newHeading) * newSpeed * dt;
@@ -373,6 +445,7 @@ export default function App() {
             newState = 'RETURNING';
           }
         } else if (state === 'RETURNING') {
+          // Navigate back to home base (0,0)
           newSpeed = 0.5;
           const dx = 0 - newX;
           const dy = 0 - newY;
@@ -394,7 +467,7 @@ export default function App() {
         if (Math.abs(newX) > 4.8 || Math.abs(newY) > 4.8) {
           newX = Math.max(-4.7, Math.min(4.7, newX));
           newY = Math.max(-4.7, Math.min(4.7, newY));
-          newState = 'BACKING_UP';
+          newState = 'REVERSING';
         }
 
         setState(newState);
@@ -523,7 +596,7 @@ def main():
               <div className="px-2 py-0.5 bg-blue-500/10 text-blue-500 text-[9px] font-bold rounded border border-blue-500/20">ACTIVE</div>
             </div>
             <div className="space-y-3">
-              {['SEARCHING', 'TARGETING', 'PUSHING', 'BACKING_UP', 'RETURNING'].map((s) => (
+              {['SEARCHING', 'TARGETING', 'PUSHING', 'REVERSING', 'RETURNING', 'AVOIDING', 'CHARGING'].map((s) => (
                 <div key={s} className="flex items-center gap-3">
                   <div className={cn(
                     "w-1.5 h-1.5 rounded-full transition-all duration-500",
@@ -557,16 +630,56 @@ def main():
             <div className="aspect-video bg-black rounded-lg border border-white/5 relative overflow-hidden flex items-center justify-center">
               {isRunning ? (
                 <div className="w-full h-full relative">
-                  <div className="absolute inset-0 bg-blue-500/10 animate-pulse" />
-                  <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-12 h-12 border-2 border-blue-500/50 rounded-full flex items-center justify-center">
-                    <div className="w-1 h-1 bg-blue-500 rounded-full" />
+                  {/* Simulated HSV Mask View */}
+                  <div 
+                    className="absolute inset-0 bg-black"
+                    style={{
+                      filter: `contrast(200%) brightness(${hsvThresholds.v[1]/255 * 100}%)`
+                    }}
+                  >
+                    {boxes.filter(b => !b.isCleared).map(b => {
+                      const dx = b.position.x - telemetry.position.x;
+                      const dy = b.position.y - telemetry.position.y;
+                      const dist = Math.sqrt(dx*dx + dy*dy);
+                      const angleToBox = Math.atan2(-dy, dx);
+                      const angleDiff = normalizeAngle(telemetry.heading - angleToBox);
+                      
+                      // Project to 2D screen
+                      const x = 50 + (angleDiff / 0.8) * 50;
+                      const size = Math.max(0, 20 - dist * 2);
+                      
+                      if (Math.abs(angleDiff) < 0.8 && dist < 8) {
+                        return (
+                          <div 
+                            key={b.id}
+                            className="absolute rounded-sm"
+                            style={{
+                              left: `${x}%`,
+                              top: '50%',
+                              width: `${size}%`,
+                              height: `${size * 1.5}%`,
+                              backgroundColor: b.color,
+                              transform: 'translate(-50%, -50%)',
+                              boxShadow: `0 0 20px ${b.color}`,
+                              opacity: hsvThresholds.s[0] < 100 ? 1 : 0.2
+                            }}
+                          />
+                        );
+                      }
+                      return null;
+                    })}
                   </div>
-                  <div className="absolute bottom-2 left-2 text-[8px] font-mono text-blue-400">
-                    TARGET_LOCKED: {telemetry.speed > 0 ? 'TRUE' : 'FALSE'}
+                  <div className="absolute inset-0 bg-blue-500/5 pointer-events-none" />
+                  <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-12 h-12 border border-white/20 rounded-full flex items-center justify-center">
+                    <div className="w-full h-[1px] bg-white/10" />
+                    <div className="h-full w-[1px] bg-white/10 absolute" />
+                  </div>
+                  <div className="absolute bottom-2 left-2 text-[7px] font-mono text-white/40 uppercase tracking-widest">
+                    HSV_FILTER_ACTIVE | {telemetry.speed > 0 ? 'LOCKED' : 'SCANNING'}
                   </div>
                 </div>
               ) : (
-                <span className="text-[10px] text-white/20 font-mono">FEED_OFFLINE</span>
+                <span className="text-[10px] text-white/20 font-mono italic">FEED_OFFLINE</span>
               )}
             </div>
           </section>
@@ -603,7 +716,7 @@ def main():
                   exit={{ opacity: 0, scale: 0.98 }}
                   className="w-full h-full"
                 >
-                  <Simulation state={state} telemetry={telemetry} boxes={boxes} />
+                  <Simulation state={state} telemetry={telemetry} boxes={boxes} obstacles={obstacles} />
                 </motion.div>
               )}
               {activeTab === 'code' && (
@@ -690,7 +803,7 @@ def main():
                       <div className="bg-white/5 p-4 rounded-lg border border-white/5 text-xs text-white/60 leading-relaxed space-y-2">
                         <p>• <strong className="text-white">Hard Boundaries:</strong> Simulation logic now enforces hard wall collisions at ±5m, ensuring objects cannot leave the arena, matching the physical Limo environment.</p>
                         <p>• <strong className="text-white">Off-Patch Logic:</strong> 'Clearing' is redefined as moving an object from its starting colored patch to a neutral zone, evidenced by the emissive glow when a box is cleared.</p>
-                        <p>• <strong className="text-white">Corner Recovery:</strong> Implemented a 'BACKING_UP' state to prevent the robot from getting stuck when pushing objects into arena corners.</p>
+                        <p>• <strong className="text-white">Corner Recovery:</strong> Implemented a 'REVERSING' state to prevent the robot from getting stuck when pushing objects into arena corners.</p>
                         <p>• <strong className="text-white">Real-Time Factor (RTF):</strong> Testing conducted at 5.0x speed for rapid iteration, while final validation is performed at 1.0x (Real-Time) to ensure sensor stability.</p>
                         <p>• <strong className="text-white">Lighting Variance:</strong> HSV masks calibrated with dynamic thresholds to handle shadows in the real arena.</p>
                         <p>• <strong className="text-white">Surface Friction:</strong> PID controller tuned for Limo's traction on smooth floor patches.</p>
@@ -796,8 +909,51 @@ def main():
                   <div className="h-full bg-blue-500 w-3/4" />
                 </div>
               </div>
+              <div>
+                <div className="flex justify-between text-[10px] mb-2">
+                  <span className="text-white/50 uppercase tracking-tighter">HSV Mask Calibration</span>
+                  <span className="text-blue-400 font-bold">AUTO</span>
+                </div>
+                <div className="space-y-2">
+                  {['H', 'S', 'V'].map((channel) => (
+                    <div key={channel} className="space-y-1">
+                      <div className="flex justify-between text-[8px] text-white/30">
+                        <span>{channel}_MIN</span>
+                        <span>{channel}_MAX</span>
+                      </div>
+                      <div className="flex gap-2 items-center">
+                        <input 
+                          type="range" 
+                          min="0" 
+                          max={channel === 'H' ? 180 : 255}
+                          value={hsvThresholds[channel.toLowerCase() as keyof typeof hsvThresholds][0]}
+                          onChange={(e) => setHsvThresholds(prev => ({
+                            ...prev,
+                            [channel.toLowerCase()]: [parseInt(e.target.value), prev[channel.toLowerCase() as keyof typeof hsvThresholds][1]]
+                          }))}
+                          className="flex-1 h-0.5 bg-white/5 rounded-full appearance-none cursor-pointer accent-blue-500"
+                        />
+                        <input 
+                          type="range" 
+                          min="0" 
+                          max={channel === 'H' ? 180 : 255}
+                          value={hsvThresholds[channel.toLowerCase() as keyof typeof hsvThresholds][1]}
+                          onChange={(e) => setHsvThresholds(prev => ({
+                            ...prev,
+                            [channel.toLowerCase()]: [prev[channel.toLowerCase() as keyof typeof hsvThresholds][0], parseInt(e.target.value)]
+                          }))}
+                          className="flex-1 h-0.5 bg-white/5 rounded-full appearance-none cursor-pointer accent-blue-500"
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
               <div className="pt-2">
-                <button className="w-full py-2 bg-white/5 hover:bg-white/10 rounded-lg text-[10px] font-bold text-white/60 border border-white/10 transition-all">
+                <button 
+                  onClick={() => setHsvThresholds({ h: [0, 180], s: [0, 255], v: [0, 255] })}
+                  className="w-full py-2 bg-white/5 hover:bg-white/10 rounded-lg text-[10px] font-bold text-white/60 border border-white/10 transition-all"
+                >
                   RECALIBRATE SENSORS
                 </button>
               </div>
