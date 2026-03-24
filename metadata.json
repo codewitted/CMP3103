@@ -1,0 +1,5 @@
+{
+  "name": "Tidy-Bot Autonomous System",
+  "description": "A comprehensive autonomous robotics control and simulation dashboard for the AgileX Limo platform, featuring real-time logic visualization and ROS2-compatible Python implementations.",
+  "requestFramePermissions": []
+}
