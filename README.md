@@ -113,6 +113,6 @@ The **Evaluation** tab provides a quantitative breakdown of the mission. Metrics
 
 ---
 
-**Author:** [Your Name]  
-**Course:** Autonomous Systems and Robotics  
-**Date:** March 2026
+**Author:** Kevin Byamukama
+**Course:** Autonomous Systems and Robotics 2526
+**Date:** April 2026
